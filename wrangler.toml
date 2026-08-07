@@ -1,0 +1,4 @@
+name = "429-worker"
+main = "src/index.ts"
+compatibility_date = "2026-08-07"
+workers_dev = true
