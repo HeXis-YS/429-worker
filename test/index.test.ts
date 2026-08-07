@@ -67,6 +67,30 @@ describe("authentication", () => {
 			"bearer allowed-token",
 		);
 	});
+
+	it("refreshes the cached allowlist when the binding changes", async () => {
+		const upstreamFetch = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(new Response("ok"));
+
+		const first = await forwardRequest(request("/health"), env);
+		const changedEnv = {
+			...env,
+			API_TOKEN_ALLOWLIST: JSON.stringify(["new-token"]),
+		};
+		const oldToken = await forwardRequest(request("/health"), changedEnv);
+		const newToken = await forwardRequest(
+			new Request("https://worker.example/health", {
+				headers: { Authorization: "Bearer new-token" },
+			}),
+			changedEnv,
+		);
+
+		expect(first.status).toBe(200);
+		expect(oldToken.status).toBe(403);
+		expect(newToken.status).toBe(200);
+		expect(upstreamFetch).toHaveBeenCalledTimes(2);
+	});
 });
 
 describe("429 retry behavior", () => {
@@ -145,6 +169,30 @@ describe("429 retry behavior", () => {
 		expect(getRequest.status).toBe(429);
 		expect(trailingSlash.status).toBe(429);
 		expect(upstreamFetch).toHaveBeenCalledTimes(3);
+	});
+
+	it("forwards a non-retried POST body as a stream", async () => {
+		const upstreamFetch = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(new Response("ok"));
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode('{"stream":true}'));
+				controller.close();
+			},
+		});
+		const incoming = new Request("https://worker.example/v1/embeddings", {
+			method: "POST",
+			headers: { Authorization: "Bearer allowed-token" },
+			body,
+			duplex: "half",
+		} as RequestInit & { duplex: "half" });
+
+		const response = await forwardRequest(incoming, env);
+		const [upstreamRequest] = upstreamFetch.mock.calls[0] as [Request];
+
+		expect(response.status).toBe(200);
+		expect(await upstreamRequest.text()).toBe('{"stream":true}');
 	});
 });
 

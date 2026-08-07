@@ -42,6 +42,8 @@ npm run deploy
   - `/v1/responses`
 - 重试之间不等待，也不使用 `Retry-After`。
 - 其他方法或路径只请求一次。
+- 只有会重试的两个 POST 路径会缓存请求体；其他非 GET/HEAD 请求只转发一次并保留流式 body。
+- 白名单在 Worker isolate 内按配置值缓存，并使用集合进行 token 查找。
 - 上游网络错误返回 `502`；配置错误返回 `500`。
 
 该 Worker 不提供 CORS、缓存、幂等键或额外的 Worker 访问控制。公开部署时，应在 Cloudflare Access 或路由层增加访问限制。

@@ -26,6 +26,14 @@ const HOP_BY_HOP_HEADERS = [
 
 const BEARER_TOKEN_PATTERN = /^Bearer\s+([^\s]+)$/i;
 
+type TokenAllowlist = ReadonlySet<string>;
+type RequestInitWithDuplex = RequestInit & { duplex?: "half" };
+
+// Environment bindings are stable for the lifetime of an isolate. Cache by
+// raw value so tests and any future multi-environment invocation remain safe.
+let cachedAllowlistRaw: string | undefined;
+let cachedAllowlist: TokenAllowlist | undefined;
+
 function noStoreHeaders(contentType: string): Headers {
 	return new Headers({
 		"cache-control": "no-store",
@@ -55,7 +63,7 @@ function authenticationFailure(): Response {
 	);
 }
 
-function parseTokenAllowlist(rawAllowlist: string | undefined): string[] {
+function parseTokenAllowlist(rawAllowlist: string | undefined): TokenAllowlist {
 	if (rawAllowlist === undefined) {
 		throw new Error("API_TOKEN_ALLOWLIST is not configured");
 	}
@@ -68,7 +76,22 @@ function parseTokenAllowlist(rawAllowlist: string | undefined): string[] {
 		throw new Error("API_TOKEN_ALLOWLIST must be a JSON array of non-empty strings");
 	}
 
-	return parsed;
+	return new Set(parsed);
+}
+
+function getTokenAllowlist(rawAllowlist: string | undefined): TokenAllowlist {
+	if (rawAllowlist === undefined) {
+		throw new Error("API_TOKEN_ALLOWLIST is not configured");
+	}
+
+	if (cachedAllowlistRaw === rawAllowlist && cachedAllowlist !== undefined) {
+		return cachedAllowlist;
+	}
+
+	const parsedAllowlist = parseTokenAllowlist(rawAllowlist);
+	cachedAllowlistRaw = rawAllowlist;
+	cachedAllowlist = parsedAllowlist;
+	return parsedAllowlist;
 }
 
 function extractBearerToken(request: Request): string | null {
@@ -81,9 +104,9 @@ function extractBearerToken(request: Request): string | null {
 	return match?.[1] ?? null;
 }
 
-function isAuthorized(request: Request, allowlist: readonly string[]): boolean {
+function isAuthorized(request: Request, allowlist: TokenAllowlist): boolean {
 	const token = extractBearerToken(request);
-	return token !== null && allowlist.includes(token);
+	return token !== null && allowlist.has(token);
 }
 
 function resolveUpstreamUrl(request: Request, rawOrigin: string): URL {
@@ -126,9 +149,10 @@ function buildUpstreamRequest(
 	request: Request,
 	upstreamUrl: URL,
 	headers: Headers,
+	retryable: boolean,
 	requestBody: ArrayBuffer | undefined,
 ): Request {
-	const init: RequestInit = {
+	const init: RequestInitWithDuplex = {
 		headers,
 		method: request.method,
 		// Returning redirects to the client avoids following an upstream redirect
@@ -136,19 +160,26 @@ function buildUpstreamRequest(
 		redirect: "manual",
 	};
 
-	if (request.method !== "GET" && request.method !== "HEAD") {
-		// A fresh copy gives every attempt an independent body and avoids relying
-		// on one-shot stream/duplex behavior across runtimes.
+	if (retryable) {
+		// A fresh copy gives every retry an independent, replayable body.
 		init.body = requestBody?.slice(0);
+	} else if (request.method !== "GET" && request.method !== "HEAD") {
+		// Non-retried requests keep their one-shot stream and are sent once.
+		init.body = request.body;
+		if (request.body !== null) {
+			// Node's Fetch implementation requires this for a ReadableStream;
+			// Workers ignore the optional dictionary member.
+			init.duplex = "half";
+		}
 	}
 
 	return new Request(upstreamUrl, init);
 }
 
 async function forwardRequest(request: Request, env: Env): Promise<Response> {
-	let allowlist: string[];
+	let allowlist: TokenAllowlist;
 	try {
-		allowlist = parseTokenAllowlist(env.API_TOKEN_ALLOWLIST);
+		allowlist = getTokenAllowlist(env.API_TOKEN_ALLOWLIST);
 	} catch {
 		return errorResponse(500, "Worker authentication is misconfigured");
 	}
@@ -166,7 +197,7 @@ async function forwardRequest(request: Request, env: Env): Promise<Response> {
 
 	const retryable = isRetryableRequest(request);
 	let requestBody: ArrayBuffer | undefined;
-	if (request.method !== "GET" && request.method !== "HEAD") {
+	if (retryable) {
 		try {
 			requestBody = await request.arrayBuffer();
 		} catch {
@@ -182,6 +213,7 @@ async function forwardRequest(request: Request, env: Env): Promise<Response> {
 			request,
 			upstreamUrl,
 			headers,
+			retryable,
 			requestBody,
 		);
 
