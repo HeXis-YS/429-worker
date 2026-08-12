@@ -131,7 +131,7 @@ describe("429 retry behavior", () => {
 		expect(calls[0].headers.get("host")).toBeNull();
 	});
 
-	it("retries responses five times and returns the final 429", async () => {
+	it("uses four retries by default and returns the final 429", async () => {
 		const finalBody = "still rate limited";
 		const upstreamFetch = vi
 			.spyOn(globalThis, "fetch")
@@ -148,6 +148,33 @@ describe("429 retry behavior", () => {
 		expect(upstreamFetch).toHaveBeenCalledTimes(5);
 		expect(response.status).toBe(429);
 		expect(await response.text()).toBe(finalBody);
+	});
+
+	it("uses the configured retry count", async () => {
+		const upstreamFetch = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(new Response("busy", { status: 429 }));
+
+		const response = await forwardRequest(
+			request("/v1/responses", { method: "POST", body: "{}" }),
+			{ ...env, MAX_RETRIES: "2" },
+		);
+
+		expect(response.status).toBe(429);
+		expect(upstreamFetch).toHaveBeenCalledTimes(3);
+	});
+
+	it("allows retries to be disabled", async () => {
+		const upstreamFetch = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(new Response("busy", { status: 429 }));
+
+		await forwardRequest(
+			request("/v1/responses", { method: "POST", body: "{}" }),
+			{ ...env, MAX_RETRIES: "0" },
+		);
+
+		expect(upstreamFetch).toHaveBeenCalledTimes(1);
 	});
 
 	it("does not retry other paths or methods", async () => {
@@ -202,6 +229,17 @@ describe("configuration and forwarding failures", () => {
 		const response = await forwardRequest(request("/health"), {
 			...env,
 			API_TOKEN_ALLOWLIST: "not-json",
+		});
+
+		expect(response.status).toBe(500);
+		expect(upstreamFetch).not.toHaveBeenCalled();
+	});
+
+	it("fails closed for an invalid retry count", async () => {
+		const upstreamFetch = vi.spyOn(globalThis, "fetch");
+		const response = await forwardRequest(request("/v1/responses"), {
+			...env,
+			MAX_RETRIES: "1.5",
 		});
 
 		expect(response.status).toBe(500);

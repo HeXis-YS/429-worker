@@ -1,9 +1,10 @@
 export interface Env {
 	UPSTREAM_ORIGIN: string;
 	API_TOKEN_ALLOWLIST: string;
+	MAX_RETRIES?: string;
 }
 
-const MAX_ATTEMPTS = 5;
+const DEFAULT_MAX_RETRIES = 4;
 const RETRY_PATHS = new Set([
 	"/v1/chat/completions",
 	"/v1/responses",
@@ -92,6 +93,23 @@ function getTokenAllowlist(rawAllowlist: string | undefined): TokenAllowlist {
 	cachedAllowlistRaw = rawAllowlist;
 	cachedAllowlist = parsedAllowlist;
 	return parsedAllowlist;
+}
+
+function parseMaxRetries(rawMaxRetries: string | undefined): number {
+	if (rawMaxRetries === undefined) {
+		return DEFAULT_MAX_RETRIES;
+	}
+
+	if (!/^\d+$/.test(rawMaxRetries)) {
+		throw new Error("MAX_RETRIES must be a non-negative integer");
+	}
+
+	const maxRetries = Number(rawMaxRetries);
+	if (!Number.isSafeInteger(maxRetries)) {
+		throw new Error("MAX_RETRIES must be a non-negative safe integer");
+	}
+
+	return maxRetries;
 }
 
 function extractBearerToken(request: Request): string | null {
@@ -184,6 +202,13 @@ async function forwardRequest(request: Request, env: Env): Promise<Response> {
 		return errorResponse(500, "Worker authentication is misconfigured");
 	}
 
+	let maxRetries: number;
+	try {
+		maxRetries = parseMaxRetries(env.MAX_RETRIES);
+	} catch {
+		return errorResponse(500, "Worker retry configuration is invalid");
+	}
+
 	if (!isAuthorized(request, allowlist)) {
 		return authenticationFailure();
 	}
@@ -205,7 +230,7 @@ async function forwardRequest(request: Request, env: Env): Promise<Response> {
 		}
 	}
 
-	const attempts = retryable ? MAX_ATTEMPTS : 1;
+	const attempts = retryable ? maxRetries + 1 : 1;
 	const headers = copyForwardHeaders(request);
 
 	for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -224,7 +249,7 @@ async function forwardRequest(request: Request, env: Env): Promise<Response> {
 			return errorResponse(502, "Upstream request failed");
 		}
 
-		if (!retryable || response.status !== 429 || attempt === MAX_ATTEMPTS) {
+		if (!retryable || response.status !== 429 || attempt === attempts) {
 			return response;
 		}
 
@@ -245,5 +270,11 @@ const worker: ExportedHandler<Env> = {
 	},
 };
 
-export { forwardRequest, isAuthorized, parseTokenAllowlist, resolveUpstreamUrl };
+export {
+	forwardRequest,
+	isAuthorized,
+	parseMaxRetries,
+	parseTokenAllowlist,
+	resolveUpstreamUrl,
+};
 export default worker;

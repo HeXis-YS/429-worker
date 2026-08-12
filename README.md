@@ -16,11 +16,14 @@ https://api.example.com
 ["token-a", "token-b"]
 ```
 
+`MAX_RETRIES` 是首次请求失败后的最大重试次数，必须是非负整数；未配置时默认为 `4`（即最多尝试 5 次）。设为 `0` 可禁用重试。
+
 本地开发时创建未提交的 `.dev.vars`：
 
 ```text
 UPSTREAM_ORIGIN=https://api.example.com
 API_TOKEN_ALLOWLIST=["token-a","token-b"]
+MAX_RETRIES=4
 ```
 
 生产部署时使用 Wrangler secrets：
@@ -28,6 +31,7 @@ API_TOKEN_ALLOWLIST=["token-a","token-b"]
 ```bash
 npx wrangler secret put UPSTREAM_ORIGIN
 npx wrangler secret put API_TOKEN_ALLOWLIST
+npx wrangler secret put MAX_RETRIES
 npm run deploy
 ```
 
@@ -37,7 +41,7 @@ npm run deploy
 - 缺少或无效 token 返回 `403` JSON；请求不会触达上游。
 - 认证通过后，原始 `Authorization` header 会透传给上游。
 - 上游 URL 使用固定 origin，并保留客户端 pathname 和 query string。
-- 仅以下两个精确路径的 POST 请求会在 429 时最多尝试五次：
+- 仅以下两个精确路径的 POST 请求会在 429 时按 `MAX_RETRIES` 配置重试：
   - `/v1/chat/completions`
   - `/v1/responses`
 - 重试之间不等待，也不使用 `Retry-After`。
