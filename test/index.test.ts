@@ -2,28 +2,34 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { forwardRequest } from "../src/index";
 
 const env = {
-	UPSTREAM_ROUTES: JSON.stringify([{ origin: "https://upstream.example" }]),
-	API_TOKEN_ALLOWLIST: JSON.stringify(["allowed-token"]),
+	UPSTREAM_ROUTES: JSON.stringify([
+		{ origin: "https://upstream.example", api_key: "sk-upstream" },
+	]),
+	WORKER_AUTH_TOKEN: "allowed-token",
 };
 
 const routedEnv = {
 	UPSTREAM_ROUTES: JSON.stringify([
-		{ origin: "https://gpt.example", models: ["gpt-4*", "gpt-3.5*"] },
+		{
+			origin: "https://gpt.example",
+			models: ["gpt-4*", "gpt-3.5*"],
+			api_key: "sk-gpt",
+		},
 		{
 			origin: "https://claude.example",
 			models: ["claude-*"],
 			api_key: "sk-claude",
 		},
-		{ origin: "https://fallback.example" },
+		{ origin: "https://fallback.example", api_key: "sk-fallback" },
 	]),
-	API_TOKEN_ALLOWLIST: JSON.stringify(["allowed-token"]),
+	WORKER_AUTH_TOKEN: "allowed-token",
 };
 
 const strictEnv = {
 	UPSTREAM_ROUTES: JSON.stringify([
-		{ origin: "https://gpt.example", models: ["gpt-4*"] },
+		{ origin: "https://gpt.example", models: ["gpt-4*"], api_key: "sk-gpt" },
 	]),
-	API_TOKEN_ALLOWLIST: JSON.stringify(["allowed-token"]),
+	WORKER_AUTH_TOKEN: "allowed-token",
 };
 
 function request(path: string, init: RequestInit = {}): Request {
@@ -74,7 +80,7 @@ describe("authentication", () => {
 		expect(upstreamFetch).not.toHaveBeenCalled();
 	});
 
-	it("accepts Bearer scheme case-insensitively and forwards it", async () => {
+	it("accepts Bearer scheme case-insensitively", async () => {
 		const upstreamFetch = vi
 			.spyOn(globalThis, "fetch")
 			.mockResolvedValue(new Response("ok"));
@@ -89,19 +95,18 @@ describe("authentication", () => {
 		expect(response.status).toBe(200);
 		const [upstreamRequest] = upstreamFetch.mock.calls[0] as [Request];
 		expect(upstreamRequest.headers.get("authorization")).toBe(
-			"bearer allowed-token",
+			"Bearer sk-upstream",
 		);
 	});
 
-	it("refreshes the cached allowlist when the binding changes", async () => {
+	it("uses the configured worker auth token", async () => {
 		const upstreamFetch = vi
 			.spyOn(globalThis, "fetch")
 			.mockResolvedValue(new Response("ok"));
 
-		const first = await forwardRequest(request("/health"), env);
 		const changedEnv = {
 			...env,
-			API_TOKEN_ALLOWLIST: JSON.stringify(["new-token"]),
+			WORKER_AUTH_TOKEN: "new-token",
 		};
 		const oldToken = await forwardRequest(request("/health"), changedEnv);
 		const newToken = await forwardRequest(
@@ -111,10 +116,9 @@ describe("authentication", () => {
 			changedEnv,
 		);
 
-		expect(first.status).toBe(200);
 		expect(oldToken.status).toBe(403);
 		expect(newToken.status).toBe(200);
-		expect(upstreamFetch).toHaveBeenCalledTimes(2);
+		expect(upstreamFetch).toHaveBeenCalledTimes(1);
 	});
 });
 
@@ -152,7 +156,7 @@ describe("429 retry behavior", () => {
 		);
 		expect(await calls[0].text()).toBe('{"model":"test","messages":[]}');
 		expect(await calls[1].text()).toBe('{"model":"test","messages":[]}');
-		expect(calls[0].headers.get("authorization")).toBe("Bearer allowed-token");
+		expect(calls[0].headers.get("authorization")).toBe("Bearer sk-upstream");
 		expect(calls[0].headers.get("host")).toBeNull();
 	});
 
@@ -360,8 +364,8 @@ describe("model-based upstream routing", () => {
 		const exactEnv = {
 			...routedEnv,
 			UPSTREAM_ROUTES: JSON.stringify([
-				{ origin: "https://exact.example", models: ["gpt-4o"] },
-				{ origin: "https://wild.example", models: ["gpt-*"] },
+				{ origin: "https://exact.example", models: ["gpt-4o"], api_key: "sk-exact" },
+				{ origin: "https://wild.example", models: ["gpt-*"], api_key: "sk-wild" },
 			]),
 		};
 
@@ -393,8 +397,8 @@ describe("model-based upstream routing", () => {
 		const overlapEnv = {
 			...routedEnv,
 			UPSTREAM_ROUTES: JSON.stringify([
-				{ origin: "https://first.example", models: ["claude-*"] },
-				{ origin: "https://second.example", models: ["*"] },
+				{ origin: "https://first.example", models: ["claude-*"], api_key: "sk-first" },
+				{ origin: "https://second.example", models: ["*"], api_key: "sk-second" },
 			]),
 		};
 
@@ -461,7 +465,7 @@ describe("model-based upstream routing", () => {
 		expect(upstreamFetch).not.toHaveBeenCalled();
 	});
 
-	it("overrides authorization with the route api_key", async () => {
+	it("always uses the route api_key for upstream authorization", async () => {
 		const upstreamFetch = vi
 			.spyOn(globalThis, "fetch")
 			.mockImplementation(async () => new Response("ok"));
@@ -477,7 +481,9 @@ describe("model-based upstream routing", () => {
 
 		const calls = upstreamFetch.mock.calls.map(([value]) => value as Request);
 		expect(calls[0].headers.get("authorization")).toBe("Bearer sk-claude");
-		expect(calls[1].headers.get("authorization")).toBe("Bearer allowed-token");
+		expect(calls[1].headers.get("authorization")).toBe("Bearer sk-gpt");
+		expect(calls[0].headers.get("authorization")).not.toContain("allowed-token");
+		expect(calls[1].headers.get("authorization")).not.toContain("allowed-token");
 	});
 
 	it("retries 429 against the same selected upstream", async () => {
@@ -513,11 +519,11 @@ describe("model-based upstream routing", () => {
 });
 
 describe("configuration and forwarding failures", () => {
-	it("fails closed for malformed allowlists", async () => {
+	it("fails closed when the worker auth token is missing", async () => {
 		const upstreamFetch = vi.spyOn(globalThis, "fetch");
 		const response = await forwardRequest(request("/health"), {
 			...env,
-			API_TOKEN_ALLOWLIST: "not-json",
+			WORKER_AUTH_TOKEN: "",
 		});
 
 		expect(response.status).toBe(500);
@@ -545,8 +551,11 @@ describe("configuration and forwarding failures", () => {
 			JSON.stringify([{ origin: 123 }]),
 			JSON.stringify([{ origin: "https://upstream.example/base" }]),
 			JSON.stringify([
-				{ origin: "https://upstream.example" },
-				{ origin: "https://other.example" },
+				{ origin: "https://upstream.example", models: ["gpt-4*"] },
+			]),
+			JSON.stringify([
+				{ origin: "https://upstream.example", api_key: "sk-a" },
+				{ origin: "https://other.example", api_key: "sk-b" },
 			]),
 			JSON.stringify([{ origin: "https://upstream.example", models: [] }]),
 			JSON.stringify([{ origin: "https://upstream.example", models: [""] }]),

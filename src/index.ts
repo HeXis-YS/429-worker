@@ -1,13 +1,13 @@
 export interface Env {
 	UPSTREAM_ROUTES: string;
-	API_TOKEN_ALLOWLIST: string;
+	WORKER_AUTH_TOKEN: string;
 	MAX_RETRIES?: string;
 }
 
 export interface UpstreamRoute {
 	origin: string;
+	api_key: string;
 	models?: string[];
-	api_key?: string;
 }
 
 const DEFAULT_MAX_RETRIES = 4;
@@ -33,13 +33,10 @@ const HOP_BY_HOP_HEADERS = [
 
 const BEARER_TOKEN_PATTERN = /^Bearer\s+([^\s]+)$/i;
 
-type TokenAllowlist = ReadonlySet<string>;
 type RequestInitWithDuplex = RequestInit & { duplex?: "half" };
 
 // Environment bindings are stable for the lifetime of an isolate. Cache by
 // raw value so tests and any future multi-environment invocation remain safe.
-let cachedAllowlistRaw: string | undefined;
-let cachedAllowlist: TokenAllowlist | undefined;
 let cachedRoutesRaw: string | undefined;
 let cachedRoutes: UpstreamRoute[] | undefined;
 
@@ -72,37 +69,6 @@ function authenticationFailure(): Response {
 	);
 }
 
-function parseTokenAllowlist(rawAllowlist: string | undefined): TokenAllowlist {
-	if (rawAllowlist === undefined) {
-		throw new Error("API_TOKEN_ALLOWLIST is not configured");
-	}
-
-	const parsed: unknown = JSON.parse(rawAllowlist);
-	if (
-		!Array.isArray(parsed) ||
-		parsed.some((token) => typeof token !== "string" || token.length === 0)
-	) {
-		throw new Error("API_TOKEN_ALLOWLIST must be a JSON array of non-empty strings");
-	}
-
-	return new Set(parsed);
-}
-
-function getTokenAllowlist(rawAllowlist: string | undefined): TokenAllowlist {
-	if (rawAllowlist === undefined) {
-		throw new Error("API_TOKEN_ALLOWLIST is not configured");
-	}
-
-	if (cachedAllowlistRaw === rawAllowlist && cachedAllowlist !== undefined) {
-		return cachedAllowlist;
-	}
-
-	const parsedAllowlist = parseTokenAllowlist(rawAllowlist);
-	cachedAllowlistRaw = rawAllowlist;
-	cachedAllowlist = parsedAllowlist;
-	return parsedAllowlist;
-}
-
 function parseMaxRetries(rawMaxRetries: string | undefined): number {
 	if (rawMaxRetries === undefined) {
 		return DEFAULT_MAX_RETRIES;
@@ -130,9 +96,21 @@ function extractBearerToken(request: Request): string | null {
 	return match?.[1] ?? null;
 }
 
-function isAuthorized(request: Request, allowlist: TokenAllowlist): boolean {
+function secureEquals(a: string, b: string): boolean {
+	if (a.length !== b.length) {
+		return false;
+	}
+
+	let difference = 0;
+	for (let index = 0; index < a.length; index += 1) {
+		difference |= a.charCodeAt(index) ^ b.charCodeAt(index);
+	}
+	return difference === 0;
+}
+
+function isAuthorized(request: Request, workerAuthToken: string): boolean {
 	const token = extractBearerToken(request);
-	return token !== null && allowlist.has(token);
+	return token !== null && secureEquals(token, workerAuthToken);
 }
 
 function parseOrigin(rawOrigin: string): URL {
@@ -194,11 +172,8 @@ function parseUpstreamRoutes(rawRoutes: string | undefined): UpstreamRoute[] {
 			models = entry.models as string[];
 		}
 
-		if (
-			entry.api_key !== undefined &&
-			(typeof entry.api_key !== "string" || entry.api_key.length === 0)
-		) {
-			throw new Error("UPSTREAM_ROUTES api_key must be a non-empty string");
+		if (typeof entry.api_key !== "string" || entry.api_key.length === 0) {
+			throw new Error("UPSTREAM_ROUTES entries must have a non-empty api_key");
 		}
 
 		if (models === undefined) {
@@ -212,10 +187,8 @@ function parseUpstreamRoutes(rawRoutes: string | undefined): UpstreamRoute[] {
 
 		routes.push({
 			origin: entry.origin,
+			api_key: entry.api_key,
 			...(models !== undefined ? { models } : {}),
-			...(entry.api_key !== undefined
-				? { api_key: entry.api_key as string }
-				: {}),
 		});
 	}
 
@@ -439,13 +412,6 @@ function noUpstreamResponse(): Response {
 }
 
 async function forwardRequest(request: Request, env: Env): Promise<Response> {
-	let allowlist: TokenAllowlist;
-	try {
-		allowlist = getTokenAllowlist(env.API_TOKEN_ALLOWLIST);
-	} catch {
-		return errorResponse(500, "Worker authentication is misconfigured");
-	}
-
 	let maxRetries: number;
 	try {
 		maxRetries = parseMaxRetries(env.MAX_RETRIES);
@@ -453,7 +419,12 @@ async function forwardRequest(request: Request, env: Env): Promise<Response> {
 		return errorResponse(500, "Worker retry configuration is invalid");
 	}
 
-	if (!isAuthorized(request, allowlist)) {
+	const workerAuthToken = env.WORKER_AUTH_TOKEN;
+	if (workerAuthToken === undefined || workerAuthToken.length === 0) {
+		return errorResponse(500, "Worker authentication is misconfigured");
+	}
+
+	if (!isAuthorized(request, workerAuthToken)) {
 		return authenticationFailure();
 	}
 
@@ -493,9 +464,9 @@ async function forwardRequest(request: Request, env: Env): Promise<Response> {
 
 	const attempts = retryable ? maxRetries + 1 : 1;
 	const headers = copyForwardHeaders(request);
-	if (route.api_key !== undefined) {
-		headers.set("authorization", `Bearer ${route.api_key}`);
-	}
+	// The client token only authorizes access to this Worker; upstreams always
+	// receive their own fixed API token.
+	headers.set("authorization", `Bearer ${route.api_key}`);
 
 	for (let attempt = 1; attempt <= attempts; attempt += 1) {
 		const upstreamRequest = buildUpstreamRequest(
@@ -551,7 +522,6 @@ export {
 	forwardRequest,
 	isAuthorized,
 	parseMaxRetries,
-	parseTokenAllowlist,
 	parseUpstreamRoutes,
 	selectUpstreamRoute,
 };
