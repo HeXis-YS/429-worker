@@ -16,7 +16,7 @@ https://api.example.com
 ["token-a", "token-b"]
 ```
 
-`MAX_RETRIES` 是首次请求失败后的最大重试次数，必须是非负整数；未配置时默认为 `4`（即最多尝试 5 次）。设为 `0` 可禁用重试。
+`MAX_RETRIES` 是首次请求失败后的最大重试次数，必须是非负整数；未配置时默认为 `4`（即最多尝试 5 次）。设为 `0` 可禁用重试。该值不是 secret，可在 `wrangler.toml` 的 `[vars]` 中配置。
 
 本地开发时创建未提交的 `.dev.vars`：
 
@@ -31,7 +31,6 @@ MAX_RETRIES=4
 ```bash
 npx wrangler secret put UPSTREAM_ORIGIN
 npx wrangler secret put API_TOKEN_ALLOWLIST
-npx wrangler secret put MAX_RETRIES
 npm run deploy
 ```
 
