@@ -1,7 +1,13 @@
 export interface Env {
-	UPSTREAM_ORIGIN: string;
+	UPSTREAM_ROUTES: string;
 	API_TOKEN_ALLOWLIST: string;
 	MAX_RETRIES?: string;
+}
+
+export interface UpstreamRoute {
+	origin: string;
+	models?: string[];
+	api_key?: string;
 }
 
 const DEFAULT_MAX_RETRIES = 4;
@@ -34,6 +40,8 @@ type RequestInitWithDuplex = RequestInit & { duplex?: "half" };
 // raw value so tests and any future multi-environment invocation remain safe.
 let cachedAllowlistRaw: string | undefined;
 let cachedAllowlist: TokenAllowlist | undefined;
+let cachedRoutesRaw: string | undefined;
+let cachedRoutes: UpstreamRoute[] | undefined;
 
 function noStoreHeaders(contentType: string): Headers {
 	return new Headers({
@@ -127,7 +135,7 @@ function isAuthorized(request: Request, allowlist: TokenAllowlist): boolean {
 	return token !== null && allowlist.has(token);
 }
 
-function resolveUpstreamUrl(request: Request, rawOrigin: string): URL {
+function parseOrigin(rawOrigin: string): URL {
 	const origin = new URL(rawOrigin);
 	if (
 		(origin.protocol !== "http:" && origin.protocol !== "https:") ||
@@ -137,9 +145,127 @@ function resolveUpstreamUrl(request: Request, rawOrigin: string): URL {
 		origin.search !== "" ||
 		origin.hash !== ""
 	) {
-		throw new Error("UPSTREAM_ORIGIN must be an HTTP(S) origin without a path");
+		throw new Error("origin must be an HTTP(S) origin without a path");
 	}
 
+	return origin;
+}
+
+function parseUpstreamRoutes(rawRoutes: string | undefined): UpstreamRoute[] {
+	if (rawRoutes === undefined) {
+		throw new Error("UPSTREAM_ROUTES is not configured");
+	}
+
+	const parsed: unknown = JSON.parse(rawRoutes);
+	if (!Array.isArray(parsed) || parsed.length === 0) {
+		throw new Error("UPSTREAM_ROUTES must be a non-empty JSON array");
+	}
+
+	const routes: UpstreamRoute[] = [];
+	let defaultCount = 0;
+	for (const rawEntry of parsed) {
+		if (
+			typeof rawEntry !== "object" ||
+			rawEntry === null ||
+			Array.isArray(rawEntry)
+		) {
+			throw new Error("UPSTREAM_ROUTES entries must be objects");
+		}
+
+		const entry = rawEntry as Record<string, unknown>;
+		if (typeof entry.origin !== "string") {
+			throw new Error("UPSTREAM_ROUTES entries must have a string origin");
+		}
+		parseOrigin(entry.origin);
+
+		let models: string[] | undefined;
+		if (entry.models !== undefined) {
+			if (
+				!Array.isArray(entry.models) ||
+				entry.models.length === 0 ||
+				entry.models.some(
+					(model) => typeof model !== "string" || model.length === 0,
+				)
+			) {
+				throw new Error(
+					"UPSTREAM_ROUTES models must be non-empty arrays of non-empty strings",
+				);
+			}
+			models = entry.models as string[];
+		}
+
+		if (
+			entry.api_key !== undefined &&
+			(typeof entry.api_key !== "string" || entry.api_key.length === 0)
+		) {
+			throw new Error("UPSTREAM_ROUTES api_key must be a non-empty string");
+		}
+
+		if (models === undefined) {
+			defaultCount += 1;
+			if (defaultCount > 1) {
+				throw new Error(
+					"UPSTREAM_ROUTES may contain at most one default entry without models",
+				);
+			}
+		}
+
+		routes.push({
+			origin: entry.origin,
+			...(models !== undefined ? { models } : {}),
+			...(entry.api_key !== undefined
+				? { api_key: entry.api_key as string }
+				: {}),
+		});
+	}
+
+	return routes;
+}
+
+function getUpstreamRoutes(rawRoutes: string | undefined): UpstreamRoute[] {
+	if (rawRoutes === undefined) {
+		throw new Error("UPSTREAM_ROUTES is not configured");
+	}
+
+	if (cachedRoutesRaw === rawRoutes && cachedRoutes !== undefined) {
+		return cachedRoutes;
+	}
+
+	const parsedRoutes = parseUpstreamRoutes(rawRoutes);
+	cachedRoutesRaw = rawRoutes;
+	cachedRoutes = parsedRoutes;
+	return parsedRoutes;
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+}
+
+function matchesModelPattern(pattern: string, model: string): boolean {
+	const expression = pattern.split("*").map(escapeRegExp).join(".*");
+	return new RegExp(`^${expression}$`).test(model);
+}
+
+function selectUpstreamRoute(
+	routes: readonly UpstreamRoute[],
+	model: string | undefined,
+): UpstreamRoute | undefined {
+	if (model !== undefined) {
+		for (const route of routes) {
+			if (
+				route.models !== undefined &&
+				route.models.some((pattern) => matchesModelPattern(pattern, model))
+			) {
+				return route;
+			}
+		}
+	}
+
+	return routes.find((route) => route.models === undefined);
+}
+
+function resolveUpstreamUrl(request: Request, rawOrigin: string): URL {
+	const origin = parseOrigin(rawOrigin);
 	const incomingUrl = new URL(request.url);
 	const upstreamUrl = new URL(origin.origin);
 	upstreamUrl.pathname = incomingUrl.pathname;
@@ -163,6 +289,36 @@ function isRetryableRequest(request: Request): boolean {
 	return RETRY_PATHS.has(new URL(request.url).pathname);
 }
 
+function isJsonPostRequest(request: Request): boolean {
+	if (request.method !== "POST") {
+		return false;
+	}
+
+	const contentType = request.headers.get("content-type");
+	if (contentType === null) {
+		return false;
+	}
+
+	const mediaType = contentType.split(";", 1)[0].trim().toLowerCase();
+	return mediaType === "application/json" || mediaType.endsWith("+json");
+}
+
+function extractModelFromBody(body: ArrayBuffer): string | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(new TextDecoder().decode(body));
+	} catch {
+		return undefined;
+	}
+
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		return undefined;
+	}
+
+	const model = (parsed as Record<string, unknown>).model;
+	return typeof model === "string" && model.length > 0 ? model : undefined;
+}
+
 function buildUpstreamRequest(
 	request: Request,
 	upstreamUrl: URL,
@@ -178,11 +334,12 @@ function buildUpstreamRequest(
 		redirect: "manual",
 	};
 
-	if (retryable) {
-		// A fresh copy gives every retry an independent, replayable body.
-		init.body = requestBody?.slice(0);
+	if (requestBody !== undefined) {
+		// A fresh copy gives every retry an independent, replayable body;
+		// a single-use request reuses the buffer read for routing.
+		init.body = retryable ? requestBody.slice(0) : requestBody;
 	} else if (request.method !== "GET" && request.method !== "HEAD") {
-		// Non-retried requests keep their one-shot stream and are sent once.
+		// Non-buffered requests keep their one-shot stream and are sent once.
 		init.body = request.body;
 		if (request.body !== null) {
 			// Node's Fetch implementation requires this for a ReadableStream;
@@ -266,6 +423,21 @@ async function cancelResponse(response: Response): Promise<void> {
 	}
 }
 
+function noUpstreamResponse(): Response {
+	return new Response(
+		JSON.stringify({
+			error: {
+				message: "No upstream is configured for this request",
+				type: "invalid_request_error",
+			},
+		}),
+		{
+			status: 400,
+			headers: noStoreHeaders("application/json; charset=utf-8"),
+		},
+	);
+}
+
 async function forwardRequest(request: Request, env: Env): Promise<Response> {
 	let allowlist: TokenAllowlist;
 	try {
@@ -285,16 +457,17 @@ async function forwardRequest(request: Request, env: Env): Promise<Response> {
 		return authenticationFailure();
 	}
 
-	let upstreamUrl: URL;
+	let routes: UpstreamRoute[];
 	try {
-		upstreamUrl = resolveUpstreamUrl(request, env.UPSTREAM_ORIGIN);
+		routes = getUpstreamRoutes(env.UPSTREAM_ROUTES);
 	} catch {
-		return errorResponse(500, "Worker upstream is misconfigured");
+		return errorResponse(500, "Worker upstream routing is misconfigured");
 	}
 
 	const retryable = isRetryableRequest(request);
+	const routeByModel = isJsonPostRequest(request);
 	let requestBody: ArrayBuffer | undefined;
-	if (retryable) {
+	if (retryable || routeByModel) {
 		try {
 			requestBody = await request.arrayBuffer();
 		} catch {
@@ -302,8 +475,27 @@ async function forwardRequest(request: Request, env: Env): Promise<Response> {
 		}
 	}
 
+	const model =
+		routeByModel && requestBody !== undefined
+			? extractModelFromBody(requestBody)
+			: undefined;
+	const route = selectUpstreamRoute(routes, model);
+	if (route === undefined) {
+		return noUpstreamResponse();
+	}
+
+	let upstreamUrl: URL;
+	try {
+		upstreamUrl = resolveUpstreamUrl(request, route.origin);
+	} catch {
+		return errorResponse(500, "Worker upstream routing is misconfigured");
+	}
+
 	const attempts = retryable ? maxRetries + 1 : 1;
 	const headers = copyForwardHeaders(request);
+	if (route.api_key !== undefined) {
+		headers.set("authorization", `Bearer ${route.api_key}`);
+	}
 
 	for (let attempt = 1; attempt <= attempts; attempt += 1) {
 		const upstreamRequest = buildUpstreamRequest(
@@ -360,6 +552,7 @@ export {
 	isAuthorized,
 	parseMaxRetries,
 	parseTokenAllowlist,
-	resolveUpstreamUrl,
+	parseUpstreamRoutes,
+	selectUpstreamRoute,
 };
 export default worker;

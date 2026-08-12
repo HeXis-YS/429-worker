@@ -2,20 +2,45 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { forwardRequest } from "../src/index";
 
 const env = {
-	UPSTREAM_ORIGIN: "https://upstream.example",
+	UPSTREAM_ROUTES: JSON.stringify([{ origin: "https://upstream.example" }]),
 	API_TOKEN_ALLOWLIST: JSON.stringify(["allowed-token"]),
 };
 
-function request(
-	path: string,
-	init: RequestInit = {},
-): Request {
+const routedEnv = {
+	UPSTREAM_ROUTES: JSON.stringify([
+		{ origin: "https://gpt.example", models: ["gpt-4*", "gpt-3.5*"] },
+		{
+			origin: "https://claude.example",
+			models: ["claude-*"],
+			api_key: "sk-claude",
+		},
+		{ origin: "https://fallback.example" },
+	]),
+	API_TOKEN_ALLOWLIST: JSON.stringify(["allowed-token"]),
+};
+
+const strictEnv = {
+	UPSTREAM_ROUTES: JSON.stringify([
+		{ origin: "https://gpt.example", models: ["gpt-4*"] },
+	]),
+	API_TOKEN_ALLOWLIST: JSON.stringify(["allowed-token"]),
+};
+
+function request(path: string, init: RequestInit = {}): Request {
 	return new Request(`https://worker.example${path}`, {
 		...init,
 		headers: {
 			Authorization: "Bearer allowed-token",
 			...(init.headers ?? {}),
 		},
+	});
+}
+
+function jsonPost(path: string, body: string): Request {
+	return request(path, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body,
 	});
 }
 
@@ -297,6 +322,196 @@ describe("429 retry behavior", () => {
 	});
 });
 
+describe("model-based upstream routing", () => {
+	it("routes JSON POST bodies by the model field", async () => {
+		const upstreamFetch = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(async () => new Response("ok"));
+
+		await forwardRequest(
+			jsonPost("/v1/chat/completions", '{"model":"gpt-4o","messages":[]}'),
+			routedEnv,
+		);
+		await forwardRequest(
+			jsonPost("/v1/responses", '{"model":"claude-3-5-sonnet","input":"hi"}'),
+			routedEnv,
+		);
+		await forwardRequest(
+			request("/v1/embeddings", {
+				method: "POST",
+				headers: { "content-type": "application/vnd.example+json" },
+				body: '{"model":"gpt-3.5-turbo","input":["x"]}',
+			}),
+			routedEnv,
+		);
+
+		const calls = upstreamFetch.mock.calls.map(([value]) => value as Request);
+		expect(calls.map((call) => new URL(call.url).origin)).toEqual([
+			"https://gpt.example",
+			"https://claude.example",
+			"https://gpt.example",
+		]);
+	});
+
+	it("matches exact names and wildcards, case-sensitively", async () => {
+		const upstreamFetch = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(async () => new Response("ok"));
+		const exactEnv = {
+			...routedEnv,
+			UPSTREAM_ROUTES: JSON.stringify([
+				{ origin: "https://exact.example", models: ["gpt-4o"] },
+				{ origin: "https://wild.example", models: ["gpt-*"] },
+			]),
+		};
+
+		await forwardRequest(
+			jsonPost("/v1/chat/completions", '{"model":"gpt-4o","messages":[]}'),
+			exactEnv,
+		);
+		await forwardRequest(
+			jsonPost("/v1/chat/completions", '{"model":"gpt-4-turbo","messages":[]}'),
+			exactEnv,
+		);
+		await forwardRequest(
+			jsonPost("/v1/chat/completions", '{"model":"gpt-4","messages":[]}'),
+			exactEnv,
+		);
+
+		const calls = upstreamFetch.mock.calls.map(([value]) => value as Request);
+		expect(calls.map((call) => new URL(call.url).origin)).toEqual([
+			"https://exact.example",
+			"https://wild.example",
+			"https://wild.example",
+		]);
+	});
+
+	it("prefers the first matching route when patterns overlap", async () => {
+		const upstreamFetch = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(async () => new Response("ok"));
+		const overlapEnv = {
+			...routedEnv,
+			UPSTREAM_ROUTES: JSON.stringify([
+				{ origin: "https://first.example", models: ["claude-*"] },
+				{ origin: "https://second.example", models: ["*"] },
+			]),
+		};
+
+		await forwardRequest(
+			jsonPost("/v1/chat/completions", '{"model":"claude-3","messages":[]}'),
+			overlapEnv,
+		);
+
+		const [upstreamRequest] = upstreamFetch.mock.calls[0] as [Request];
+		expect(new URL(upstreamRequest.url).origin).toBe("https://first.example");
+	});
+
+	it("uses the default route when no model can be extracted", async () => {
+		const upstreamFetch = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(async () => new Response("ok"));
+
+		await forwardRequest(request("/health"), routedEnv);
+		await forwardRequest(
+			request("/v1/chat/completions", {
+				method: "POST",
+				headers: { "content-type": "text/plain" },
+				body: "plain",
+			}),
+			routedEnv,
+		);
+		await forwardRequest(
+			request("/v1/chat/completions", {
+				method: "POST",
+				headers: { "content-type": "application/json; charset=utf-8" },
+				body: '{"messages":[]}',
+			}),
+			routedEnv,
+		);
+		await forwardRequest(
+			jsonPost("/v1/chat/completions", "not-json"),
+			routedEnv,
+		);
+
+		const calls = upstreamFetch.mock.calls.map(([value]) => value as Request);
+		expect(calls).toHaveLength(4);
+		for (const call of calls) {
+			expect(new URL(call.url).origin).toBe("https://fallback.example");
+		}
+	});
+
+	it("returns 400 when no route matches and no default exists", async () => {
+		const upstreamFetch = vi.spyOn(globalThis, "fetch");
+
+		const response = await forwardRequest(
+			jsonPost("/v1/chat/completions", '{"model":"unknown","messages":[]}'),
+			strictEnv,
+		);
+		const getResponse = await forwardRequest(request("/health"), strictEnv);
+
+		expect(response.status).toBe(400);
+		expect(getResponse.status).toBe(400);
+		expect(await response.json()).toEqual({
+			error: {
+				message: "No upstream is configured for this request",
+				type: "invalid_request_error",
+			},
+		});
+		expect(upstreamFetch).not.toHaveBeenCalled();
+	});
+
+	it("overrides authorization with the route api_key", async () => {
+		const upstreamFetch = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(async () => new Response("ok"));
+
+		await forwardRequest(
+			jsonPost("/v1/chat/completions", '{"model":"claude-3","messages":[]}'),
+			routedEnv,
+		);
+		await forwardRequest(
+			jsonPost("/v1/chat/completions", '{"model":"gpt-4o","messages":[]}'),
+			routedEnv,
+		);
+
+		const calls = upstreamFetch.mock.calls.map(([value]) => value as Request);
+		expect(calls[0].headers.get("authorization")).toBe("Bearer sk-claude");
+		expect(calls[1].headers.get("authorization")).toBe("Bearer allowed-token");
+	});
+
+	it("retries 429 against the same selected upstream", async () => {
+		const upstreamFetch = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(new Response("busy", { status: 429 }))
+			.mockResolvedValueOnce(new Response("ok"));
+
+		const response = await forwardRequest(
+			jsonPost("/v1/chat/completions", '{"model":"gpt-4o","messages":[]}'),
+			routedEnv,
+		);
+
+		expect(response.status).toBe(200);
+		const calls = upstreamFetch.mock.calls.map(([value]) => value as Request);
+		expect(calls).toHaveLength(2);
+		for (const call of calls) {
+			expect(new URL(call.url).origin).toBe("https://gpt.example");
+		}
+	});
+
+	it("forwards the buffered JSON body unchanged", async () => {
+		const upstreamFetch = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(async () => new Response("ok"));
+		const body = '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}';
+
+		await forwardRequest(jsonPost("/v1/chat/completions", body), routedEnv);
+
+		const [upstreamRequest] = upstreamFetch.mock.calls[0] as [Request];
+		expect(await upstreamRequest.text()).toBe(body);
+	});
+});
+
 describe("configuration and forwarding failures", () => {
 	it("fails closed for malformed allowlists", async () => {
 		const upstreamFetch = vi.spyOn(globalThis, "fetch");
@@ -320,14 +535,31 @@ describe("configuration and forwarding failures", () => {
 		expect(upstreamFetch).not.toHaveBeenCalled();
 	});
 
-	it("returns 500 for a non-origin upstream configuration", async () => {
+	it("fails closed for invalid upstream route configurations", async () => {
 		const upstreamFetch = vi.spyOn(globalThis, "fetch");
-		const response = await forwardRequest(request("/health"), {
-			...env,
-			UPSTREAM_ORIGIN: "https://upstream.example/base",
-		});
+		const invalidRoutes = [
+			"not-json",
+			"[]",
+			JSON.stringify(["not-an-object"]),
+			JSON.stringify([{}]),
+			JSON.stringify([{ origin: 123 }]),
+			JSON.stringify([{ origin: "https://upstream.example/base" }]),
+			JSON.stringify([
+				{ origin: "https://upstream.example" },
+				{ origin: "https://other.example" },
+			]),
+			JSON.stringify([{ origin: "https://upstream.example", models: [] }]),
+			JSON.stringify([{ origin: "https://upstream.example", models: [""] }]),
+			JSON.stringify([{ origin: "https://upstream.example", api_key: "" }]),
+		];
 
-		expect(response.status).toBe(500);
+		for (const routes of invalidRoutes) {
+			const response = await forwardRequest(request("/health"), {
+				...env,
+				UPSTREAM_ROUTES: routes,
+			});
+			expect(response.status).toBe(500);
+		}
 		expect(upstreamFetch).not.toHaveBeenCalled();
 	});
 
