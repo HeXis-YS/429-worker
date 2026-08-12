@@ -177,6 +177,80 @@ describe("429 retry behavior", () => {
 		expect(upstreamFetch).toHaveBeenCalledTimes(1);
 	});
 
+	it("retries when the upstream closes before sending a response", async () => {
+		const upstreamFetch = vi
+			.spyOn(globalThis, "fetch")
+			.mockRejectedValueOnce(new Error("connection closed before first byte"))
+			.mockResolvedValueOnce(new Response("ok"));
+
+		const response = await forwardRequest(
+			request("/v1/responses", { method: "POST", body: "{}" }),
+			{ ...env, MAX_RETRIES: "1" },
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("ok");
+		expect(upstreamFetch).toHaveBeenCalledTimes(2);
+	});
+
+	it("retries when the response stream fails before its first byte", async () => {
+		const closedBody = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.error(new Error("connection closed before first byte"));
+			},
+		});
+		const upstreamFetch = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(new Response(closedBody, { status: 200 }))
+			.mockResolvedValueOnce(new Response("ok"));
+
+		const response = await forwardRequest(
+			request("/v1/responses", { method: "POST", body: "{}" }),
+			{ ...env, MAX_RETRIES: "1" },
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("ok");
+		expect(upstreamFetch).toHaveBeenCalledTimes(2);
+	});
+
+	it("preserves response data after the first byte", async () => {
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode("first"));
+				controller.enqueue(new TextEncoder().encode("second"));
+				controller.close();
+			},
+		});
+		const upstreamFetch = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(new Response(body, { status: 200 }));
+
+		const response = await forwardRequest(
+			request("/v1/responses", { method: "POST", body: "{}" }),
+			env,
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("firstsecond");
+		expect(upstreamFetch).toHaveBeenCalledTimes(1);
+	});
+
+	it("returns 502 after all retry attempts fail before a response", async () => {
+		const upstreamFetch = vi
+			.spyOn(globalThis, "fetch")
+			.mockRejectedValue(new Error("connection closed before first byte"));
+
+		const response = await forwardRequest(
+			request("/v1/responses", { method: "POST", body: "{}" }),
+			{ ...env, MAX_RETRIES: "1" },
+		);
+
+		expect(response.status).toBe(502);
+		expect(await response.text()).toBe("Upstream request failed");
+		expect(upstreamFetch).toHaveBeenCalledTimes(2);
+	});
+
 	it("does not retry other paths or methods", async () => {
 		const upstreamFetch = vi
 			.spyOn(globalThis, "fetch")

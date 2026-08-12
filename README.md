@@ -1,6 +1,6 @@
 # 429 Worker
 
-一个固定上游的 Cloudflare Worker 代理。所有请求都需要通过 API token 白名单认证；只有 `POST /v1/chat/completions` 和 `POST /v1/responses` 在上游返回 `429` 时会立即重试。
+一个固定上游的 Cloudflare Worker 代理。所有请求都需要通过 API token 白名单认证；只有 `POST /v1/chat/completions` 和 `POST /v1/responses` 在上游返回 `429` 或首字节前连接关闭时会立即重试。
 
 ## 配置
 
@@ -40,14 +40,14 @@ npm run deploy
 - 缺少或无效 token 返回 `403` JSON；请求不会触达上游。
 - 认证通过后，原始 `Authorization` header 会透传给上游。
 - 上游 URL 使用固定 origin，并保留客户端 pathname 和 query string。
-- 仅以下两个精确路径的 POST 请求会在 429 时按 `MAX_RETRIES` 配置重试：
+- 仅以下两个精确路径的 POST 请求会在 429 或上游响应首字节前连接关闭时按 `MAX_RETRIES` 配置重试：
   - `/v1/chat/completions`
   - `/v1/responses`
 - 重试之间不等待，也不使用 `Retry-After`。
 - 其他方法或路径只请求一次。
 - 只有会重试的两个 POST 路径会缓存请求体；其他非 GET/HEAD 请求只转发一次并保留流式 body。
 - 白名单在 Worker isolate 内按配置值缓存，并使用集合进行 token 查找。
-- 上游网络错误返回 `502`；配置错误返回 `500`。
+- 重试耗尽后的上游网络错误返回 `502`；配置错误返回 `500`。
 
 该 Worker 不提供 CORS、缓存、幂等键或额外的 Worker 访问控制。公开部署时，应在 Cloudflare Access 或路由层增加访问限制。
 

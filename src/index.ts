@@ -194,6 +194,78 @@ function buildUpstreamRequest(
 	return new Request(upstreamUrl, init);
 }
 
+async function waitForResponseFirstByte(response: Response): Promise<Response> {
+	// Probe one chunk so a connection failure before any response data can be retried
+	// without replaying a response that has already reached the client.
+	if (response.body === null) {
+		return response;
+	}
+
+	const reader = response.body.getReader();
+	let firstChunk: Uint8Array | undefined;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) {
+				reader.releaseLock();
+				return response;
+			}
+
+			if (value.byteLength > 0) {
+				firstChunk = value;
+				break;
+			}
+		}
+	} catch (error) {
+		reader.releaseLock();
+		throw error;
+	}
+
+	let readerReleased = false;
+	const releaseReader = () => {
+		if (!readerReleased) {
+			reader.releaseLock();
+			readerReleased = true;
+		}
+	};
+	const body = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(firstChunk);
+		},
+		async pull(controller) {
+			try {
+				const { done, value } = await reader.read();
+				if (done) {
+					releaseReader();
+					controller.close();
+				} else if (value.byteLength > 0) {
+					controller.enqueue(value);
+				}
+			} catch (error) {
+				releaseReader();
+				controller.error(error);
+			}
+		},
+		cancel(reason) {
+			return reader.cancel(reason).finally(releaseReader);
+		},
+	});
+
+	return new Response(body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: response.headers,
+	});
+}
+
+async function cancelResponse(response: Response): Promise<void> {
+	try {
+		await response.body?.cancel();
+	} catch {
+		// Cancellation failure must not prevent the required immediate retry.
+	}
+}
+
 async function forwardRequest(request: Request, env: Env): Promise<Response> {
 	let allowlist: TokenAllowlist;
 	try {
@@ -246,7 +318,24 @@ async function forwardRequest(request: Request, env: Env): Promise<Response> {
 		try {
 			response = await fetch(upstreamRequest);
 		} catch {
-			return errorResponse(502, "Upstream request failed");
+			if (!retryable || attempt === attempts) {
+				return errorResponse(502, "Upstream request failed");
+			}
+
+			continue;
+		}
+
+		if (retryable && response.status !== 429) {
+			try {
+				response = await waitForResponseFirstByte(response);
+			} catch {
+				if (attempt === attempts) {
+					return errorResponse(502, "Upstream request failed");
+				}
+
+				await cancelResponse(response);
+				continue;
+			}
 		}
 
 		if (!retryable || response.status !== 429 || attempt === attempts) {
@@ -254,11 +343,7 @@ async function forwardRequest(request: Request, env: Env): Promise<Response> {
 		}
 
 		// Release the intermediate response before issuing another upstream fetch.
-		try {
-			await response.body?.cancel();
-		} catch {
-			// Cancellation failure must not prevent the required immediate retry.
-		}
+		await cancelResponse(response);
 	}
 
 	return errorResponse(502, "Retry loop terminated unexpectedly");
