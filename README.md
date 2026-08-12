@@ -4,43 +4,41 @@
 
 ## 配置
 
-`UPSTREAM_ROUTES` 是 JSON 数组字符串，配置在 `wrangler.toml` 的 `[vars]` 中（不是 secret），按数组顺序匹配模型，第一条命中生效：
+`UPSTREAM_ROUTES` 是 JSON 数组字符串（secret），按数组顺序匹配模型，第一条命中生效：
 
-```toml
-[vars]
-UPSTREAM_ROUTES = """
+```json
 [
   { "origin": "https://gpt.example.com", "models": ["gpt-4*", "gpt-3.5*"], "api_key": "sk-gpt" },
   { "origin": "https://claude.example.com", "models": ["claude-*"], "api_key": "sk-claude" },
   { "origin": "https://default.example.com", "api_key": "sk-default" }
 ]
-"""
 ```
-
-编辑上游配置只需要修改 `wrangler.toml` 后重新部署，无需重写 secret。
 
 - `origin` 必须是没有路径、查询参数或认证信息的 HTTP(S) origin。
 - `api_key` 必填：该上游的固定 API token，不能包含空白字符。Worker 转发给该上游时始终使用 `Authorization: Bearer <api_key>`，客户端 token 不会被转发到上游。
 - `models` 可选：非空字符串数组，支持 `*` 通配符（无 `*` 即为精确匹配），大小写敏感。省略 `models` 的条目是默认上游，全配置最多一个。
 - 若请求没有匹配任何条目且未配置默认上游，返回 `400`，请求不会触达上游。
 
-`WORKER_AUTH_TOKEN` 是客户端访问本 Worker 的唯一 token（不含 `Bearer ` 前缀），仍作为 Wrangler secret 配置：
+`WORKER_AUTH_TOKEN` 是客户端访问本 Worker 的唯一 token（不含 `Bearer ` 前缀），作为 Wrangler secret 配置：
 
 ```text
 token-a
 ```
 
-`MAX_RETRIES` 是首次请求失败后的最大重试次数，必须是非负整数；未配置时默认为 `4`（即最多尝试 5 次）。设为 `0` 可禁用重试。该值不是 secret，可在 `wrangler.toml` 的 `[vars]` 中配置。
+`MAX_RETRIES` 是首次请求失败后的最大重试次数，必须是非负整数；未配置时默认为 `4`（即最多尝试 5 次）。设为 `0` 可禁用重试。该值不是 secret，可选配置。
 
-本地开发时创建未提交的 `.dev.vars` 存放 secret（`UPSTREAM_ROUTES` 与 `MAX_RETRIES` 已在 `wrangler.toml` 中）：
+本地开发时创建未提交的 `.dev.vars` 配置全部环境变量：
 
 ```text
+UPSTREAM_ROUTES=[{"origin":"https://api.example.com","api_key":"sk-..."}]
 WORKER_AUTH_TOKEN=token-a
+MAX_RETRIES=4
 ```
 
-生产部署时设置 secret 并部署：
+生产部署时设置 secrets 并部署：
 
 ```bash
+npx wrangler secret put UPSTREAM_ROUTES
 npx wrangler secret put WORKER_AUTH_TOKEN
 npm run deploy
 ```

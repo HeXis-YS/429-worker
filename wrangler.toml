@@ -2,13 +2,3 @@ name = "429-worker"
 main = "src/index.ts"
 compatibility_date = "2026-08-07"
 workers_dev = true
-
-[vars]
-MAX_RETRIES = "4"
-UPSTREAM_ROUTES = """
-[
-  { "origin": "https://gpt.example.com", "models": ["gpt-4*", "gpt-3.5*"], "api_key": "sk-gpt" },
-  { "origin": "https://claude.example.com", "models": ["claude-*"], "api_key": "sk-claude" },
-  { "origin": "https://default.example.com", "api_key": "sk-default" }
-]
-"""
